@@ -1,0 +1,25 @@
+# 构建产物（PyInstaller）
+build/
+dist/
+*.spec
+!SystemPanel.spec
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 第三方二进制不进仓库（见 README 第 2 步自行下载）
+_engine/
+*.dll
+*.sys
+
+# 本地日志与任务备份
+*.log
+
+# 本地工具目录与一次性验证产物
+.zcode/
+_temp_result.txt
+_disk_temp_result.txt
+_ui_result.txt
+
+# 打包入口只是 PyInstaller 用的壳，panel/ 才是本体（保留 run_panel.py，不忽略）
