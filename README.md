@@ -14,7 +14,7 @@
 - **嵌入壁纸层**：无边框、半透明，鼠标穿透不挡桌面图标
 - **聚焦可拖、失焦上锁**：点一下面板获得焦点拖动位置，点别处自动锁定并记住位置
 - **多显示器**：可指定显示在第几块屏，换显示器布局后自动钳制回可见区
-- **休眠盘跳过**：外接机械盘休眠时不唤醒、不检测（仅 USB 外接盘参与判定，NVMe 永不误判）
+- **休眠盘跳过**：机械盘无 IO 时不发 SMART、不重置睡眠计时（温度显示旧值；仅 USB 外接盘参与休眠判定，NVMe/SSD 永不误判）
 - **优雅降级**：非管理员权限下温度项留空，其他指标正常显示
 - **开机自启**：计划任务 + 最高权限 + 后台运行（无控制台窗口），任务超时设为无限制、崩溃自动重启
 
@@ -86,6 +86,19 @@ pip install -r requirements.txt
 1. 去 [LibreHardwareMonitor releases](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases) 下载对应版本
 2. 解压后把 `LibreHardwareMonitorLib.dll` 及其同目录依赖放到 `_engine/LibreHardwareMonitor/`
 3. 面板只加载 `LibreHardwareMonitorLib.dll` 这一个文件（`.exe` / `.pdb` / `.xml` / 语言包都不需要）
+
+### 2.1 安装 PawnIO 驱动（CPU 温度必需，中断-free 的前提）
+
+CPU 温度走 MSR 直读（微秒级，不经过 IO 栈、不中断系统），但 MSR 必须进 ring0，
+依赖 PawnIO 内核驱动（已签名，HVCI/内存完整性开启时也能加载）。**没装它时
+`ReadMsr` 全返回 0，CPU 温度显示为空**——不是面板 bug，是驱动缺失：
+
+1. 去 [pawnio.eu](https://pawnio.eu) 下载 `PawnIO_setup.exe`（官方签名版）
+2. 以管理员身份运行：`PawnIO_setup.exe -install -silent`（对比：旧 WinRing0 版会被 Defender 误报，PawnIO 不会）
+3. 确认服务在跑：`sc query PawnIO` 应为 `RUNNING`
+4. 重启面板（旧进程缓存的 TjMax 是驱动缺失时的回退值，必须重起；`install.bat` 跑一遍即可）
+
+装完后 CPU 温度即恢复，且全程不走 `Storage`/`CPU` 的 `hw.Update()`，游戏中也零中断。
 
 ### 3. 运行
 

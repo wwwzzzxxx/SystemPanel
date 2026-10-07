@@ -426,6 +426,9 @@ _pdh_busy = _PdhDiskBusy()
 
 # collect() 各段耗时（秒），供面板发现卡顿来源；平时不打印，超阈值才报
 _last_timing: dict[str, float] = {}
+# 最近一轮 CPU 温度来源：lhm/msr | msacpi | smbios-probe | none（约每分钟打一次日志）
+_cpu_temp_source = "?"
+_collect_count = 0
 
 
 def _cpu_package_via_msr() -> float | None:
@@ -465,9 +468,14 @@ def _cpu_package_via_msr() -> float | None:
         return None
 
 
-def _get_lhm_temps_if_admin(sleeping_map: dict | None = None) -> dict[str, float]:
+def _get_lhm_temps_if_admin(
+    sleeping_map: dict | None = None,
+    idle_hdd_pds: list | None = None,
+) -> dict[str, float]:
     """管理员下一次性扫描 CPU/Storage 温度，非管理员直接返回空字典。
     对已判休眠的硬盘跳过 Update()：LHM 读温度要发 SMART 指令，会唤醒休眠的机械盘。
+    对空闲机械盘（本轮无真实 IO，休眠计数仍在累积）同样跳过：SMART 会重置它的
+    睡眠计时。被跳过的盘温度沿用缓存显示旧值，不发新查询。
     """
     if not is_admin():
         return {}
@@ -515,18 +523,26 @@ def _get_lhm_temps_if_admin(sleeping_map: dict | None = None) -> dict[str, float
             for pd in sleeping_pds
         ]
         any_unlabeled = sleeping_pds and any(not lab for lab in sleeping_labels)
+        # 空闲机械盘的 WMI 标签：本轮无真实 IO 就不查，睡眠计时不受扰
+        idle_labels = [
+            (_physical_to_label.get(pd) or "").strip()
+            for pd in (idle_hdd_pds or [])
+        ]
+        idle_unlabeled = bool(idle_hdd_pds) and any(not lab for lab in idle_labels)
         result: dict[str, float] = {}
         import time as _tmod
         _hw_ms: dict[str, float] = {}
+        skipped_hw: set[str] = set()
         for hw in _lhm_computer.Hardware:
             ht = str(hw.HardwareType)
             if ht == "Cpu" and msr_temp is not None:
                 continue  # MSR 已拿到 Package 温度，不 Update（省 240ms 系统 stall）
-            if ht == "Storage" and sleeping_pds:
-                if any_unlabeled or any(
+            if ht == "Storage" and (sleeping_pds or idle_hdd_pds):
+                if any_unlabeled or idle_unlabeled or any(
                     match_disk_name(lab, hw.Name) or match_disk_name(hw.Name, lab)
-                    for lab in sleeping_labels if lab
+                    for lab in ([*sleeping_labels, *idle_labels]) if lab
                 ):
+                    skipped_hw.add(hw.Name)
                     continue
             _t1 = _tmod.perf_counter()
             hw.Update()
@@ -543,6 +559,14 @@ def _get_lhm_temps_if_admin(sleeping_map: dict | None = None) -> dict[str, float
                         result[f"disk:{hw.Name}:{s.Name}"] = float(s.Value)
             for sub in hw.SubHardware:
                 sub.Update()
+        # 被跳过的盘沿用上轮缓存（显示旧值，不发新 SMART，睡眠计时不受扰）
+        if skipped_hw and _lhm_cache:
+            for k, v in _lhm_cache.items():
+                if not k.startswith("disk:") or k in result:
+                    continue
+                parts = k.split(":")
+                if len(parts) >= 2 and parts[1] in skipped_hw:
+                    result[k] = v
         _lhm_cache = dict(result)
         if msr_temp is not None:
             _lhm_cache["cpu:CPU Package"] = msr_temp
@@ -553,6 +577,72 @@ def _get_lhm_temps_if_admin(sleeping_map: dict | None = None) -> dict[str, float
         return result
     except Exception:
         return dict(_lhm_cache) if _lhm_cache else {}
+
+
+_wmi_cpu_next_try = 0.0  # WMI 兜底失败后 60s 内不再试（WMI 枚举慢，不能每轮都查）
+_wmi_cpu_cache: tuple[float, float | None, str | None] = (0.0, None, None)
+
+
+def _cpu_temp_wmi_fallback() -> tuple[float | None, str | None]:
+    """不走 ring0 的 CPU 温度兜底（HVCI 开着时 LHM/MSR 全灭用它）。
+
+    MSAcpi_ThermalZoneTemperature：ACPI 热区，单位 0.1K；台式机主板经常不提供。
+    Win32_TemperatureProbe：SMBIOS 探针， populated 的机器很少。
+    返回 (温度, 来源)，都没有返回 (None, None)。
+    """
+    global _wmi_cpu_next_try
+    now = time.time()
+    if now < _wmi_cpu_next_try:
+        return None, None
+    _cts, _ct, _cs = _wmi_cpu_cache
+    if _ct is not None and now - _cts < 10.0:
+        return _ct, _cs
+    try:
+        import win32com.client as _wc  # type: ignore
+
+        wmi = _wc.GetObject("winmgmts:root\\wmi")
+        best: float | None = None
+        try:
+            for z in wmi.ExecQuery(
+                "SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature"
+            ):
+                try:
+                    raw = int(getattr(z, "CurrentTemperature", 0) or 0)
+                except Exception:
+                    continue
+                if raw <= 0:
+                    continue
+                c = raw / 10.0 - 273.15
+                if -40.0 <= c <= 125.0 and (best is None or c > best):
+                    best = c
+        except Exception:
+            pass
+        if best is not None:
+            _wmi_cpu_cache = (now, best, "msacpi")
+            return best, "msacpi"
+        try:
+            wmi2 = _wc.GetObject("winmgmts:")
+            for p in wmi2.ExecQuery(
+                "SELECT CurrentReading FROM Win32_TemperatureProbe"
+            ):
+                try:
+                    raw = int(getattr(p, "CurrentReading", 0) or 0)
+                except Exception:
+                    continue
+                if raw <= 0:
+                    continue
+                c = raw / 10.0 - 273.15
+                if -40.0 <= c <= 125.0 and (best is None or c > best):
+                    best = c
+        except Exception:
+            pass
+        if best is not None:
+            _wmi_cpu_cache = (now, best, "smbios-probe")
+            return best, "smbios-probe"
+    except Exception:
+        pass
+    _wmi_cpu_next_try = now + 60.0
+    return None, None
 
 
 # 盘符与 PhysicalDrive 的粗映射，供 UI 显示友好名称
@@ -714,7 +804,14 @@ def match_disk_name(label: str, hw_name: str) -> bool:
     return len(common) >= 2
 
 
-def collect() -> Metrics:
+def collect(skip_disk_temp: bool = False) -> Metrics:
+    """采集一轮指标。
+
+    skip_disk_temp=True（面板不可见时由调用方传入）：跳过所有
+    Storage hw.Update()（同步 SMART passthrough，会顶系统一下），
+    CPU 仍走 MSR 直读（微秒级，不中断），硬盘温度沿用缓存不刷新。
+    """
+    global _cpu_temp_source
     _ensure_imports()
     assert _psutil is not None
     m = Metrics(is_admin=is_admin(), timestamp=time.time())
@@ -769,6 +866,13 @@ def collect() -> Metrics:
             _refresh_disk_labels()
 
         busy_map, sleeping_map = _tracker.update_busy(per_disk, _physical_to_bus, _physical_to_media)
+        # 空闲机械盘本轮不查温度：速率为 0（休眠计数仍在累积）时任何 SMART
+        # 都会重置/打断它的睡眠计时。SSD/NVMe 不受影响，照常扫描。
+        idle_hdd_pds = [
+            pd for pd in per_disk
+            if (_physical_to_media.get(pd, "").lower() == "hdd"
+                and _tracker._zero_streak.get(pd, 0) > 0)
+        ]
 
         # 繁忙率优先用 PDH（psutil 的 I/O 时间在 NVMe 上恒为 0），取不到再退回差分值
         pdh_busy = _pdh_busy.read()
@@ -817,11 +921,13 @@ def collect() -> Metrics:
                     drive_labels[pd] = letter
         except Exception:
             pass
-        # 温度（仅非休眠且管理员才读）
+        # 温度（仅非休眠且管理员才读）。
+        # 面板不可见时跳过 Storage.Update()：任何 SMART 查询都要过 storport
+        # 等盘中断返回，游戏中表现为一次系统级抖动；CPU 走 MSR 不受影响。
         temp_map: dict[str, float] = {}
-        if m.is_admin:
+        if m.is_admin and not skip_disk_temp:
             _t_lhm = time.perf_counter()
-            raw_temps = _get_lhm_temps_if_admin(sleeping_map)
+            raw_temps = _get_lhm_temps_if_admin(sleeping_map, idle_hdd_pds)
             _last_timing["lhm"] = time.perf_counter() - _t_lhm
             pkg = raw_temps.get("cpu:CPU Package")
             if pkg is None:
@@ -832,9 +938,28 @@ def collect() -> Metrics:
                             pkg = v
                             break
             m.cpu_temp = pkg
+            if m.cpu_temp is None:
+                # ring0 全灭（HVCI）时走 WMI 兜底
+                m.cpu_temp, _src = _cpu_temp_wmi_fallback()
+                _cpu_temp_source = _src or "none"
+            else:
+                _cpu_temp_source = "lhm/msr"
             for k, v in raw_temps.items():
                 if k.startswith("disk:"):
                     temp_map[k] = v
+        elif m.is_admin and skip_disk_temp:
+            # 不可见：CPU 仍走 MSR 直读（微秒级，不碰 IO 栈），盘温沿用空
+            # （用户看不到，下一轮可见时自动刷新；不进 LHM，不碰盘）。
+            _last_timing["lhm"] = 0.0
+            try:
+                m.cpu_temp = _cpu_package_via_msr()
+            except Exception:
+                m.cpu_temp = None
+            if m.cpu_temp is None:
+                m.cpu_temp, _src = _cpu_temp_wmi_fallback()
+                _cpu_temp_source = _src or "none"
+            else:
+                _cpu_temp_source = "lhm/msr"
 
         for pd_name in sorted(per_disk.keys(), key=lambda x: int(x.replace("PhysicalDrive", "")) if x.replace("PhysicalDrive", "").isdigit() else 999):
             raw_label = _physical_to_label.get(pd_name, pd_name)
@@ -891,6 +1016,10 @@ def collect() -> Metrics:
         pass
 
     _last_timing["total"] = time.perf_counter() - _t0
+    global _collect_count
+    _collect_count += 1
+    if _collect_count % 20 == 1:
+        print(f"[temp] cpu={m.cpu_temp} src={_cpu_temp_source} admin={m.is_admin}")
     return m
 
 

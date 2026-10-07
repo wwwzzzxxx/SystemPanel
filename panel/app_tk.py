@@ -14,6 +14,7 @@ from tkinter import font as tkfont
 from .collector import Metrics, collect, warmup
 from . import collector as _collector
 from . import ops
+from .visible import game_blocking_temp, is_panel_visible
 from .contextmenu import PanelMenu
 from .widgets_tk import _BG, _CARD, _MUTED, _ACCENT_CPU, _ACCENT_GPU, _ACCENT_MEM, _ACCENT_VRAM, _ACCENT_DISK, _ACCENT_NET, BarRow, RingWidget, Section, rounded_rect
 
@@ -720,7 +721,27 @@ class PanelApp:
 
     def _tick(self):
         try:
-            m = collect()
+            # 看不见就不问盘 + 白名单游戏在跑也不问盘：两种情况都跳过
+            # Storage SMART（中断源头），CPU(MSR)/GPU(NVML) 照常。
+            try:
+                _visible = is_panel_visible(self.get_hwnd())
+            except Exception:
+                _visible = True
+            try:
+                _game = game_blocking_temp()
+            except Exception:
+                _game = None
+            _skip = (not _visible) or (_game is not None)
+            _state = ("visible", _visible, _game)
+            if _state != getattr(self, "_vis_state", None):
+                if _game is not None:
+                    print(f"[panel] {_game} 运行中(-暂停硬盘温度轮询)")
+                elif not _visible:
+                    print("[panel] 面板被盖住(-暂停硬盘温度轮询)")
+                else:
+                    print("[panel] 可见(-恢复硬盘温度轮询)")
+            self._vis_state = _state
+            m = collect(skip_disk_temp=_skip)
             _t = time.perf_counter()
             self.render(m)
             _render_dt = time.perf_counter() - _t
