@@ -608,6 +608,20 @@ class PanelApp:
         except Exception as e:
             print(f"[panel] 开机启动切换失败: {e}", file=sys.stderr)
 
+    def temp_enabled(self) -> bool:
+        """温度显示开关（右键菜单），默认开。关时 collect(skip_temps=True)：
+        NVML/MSR/LHM/WMI 一个温度都不读，界面不显示 °C。"""
+        return bool(self._cfg.get("show_temp", True))
+
+    def toggle_temp(self):
+        self._cfg["show_temp"] = not self.temp_enabled()
+        save_config(self._cfg)  # 持久化：重启后仍是这个状态
+        print(f"[panel] 温度显示: {'开' if self._cfg['show_temp'] else '关（不再读取任何温度）'}")
+        try:
+            self._tick()  # 立即生效，不用等下一轮 3s
+        except Exception as e:
+            print(f"[panel] 立即刷新失败: {e}", file=sys.stderr)
+
     def quit_panel(self):
         """退出：先卸钩子（连带停事件线程）再关窗口。"""
         print("[panel] 退出")
@@ -732,6 +746,7 @@ class PanelApp:
             except Exception:
                 _game = None
             _skip = (not _visible) or (_game is not None)
+            _show_temp = self.temp_enabled()
             _state = ("visible", _visible, _game)
             if _state != getattr(self, "_vis_state", None):
                 if _game is not None:
@@ -741,7 +756,7 @@ class PanelApp:
                 else:
                     print("[panel] 可见(-恢复硬盘温度轮询)")
             self._vis_state = _state
-            m = collect(skip_disk_temp=_skip)
+            m = collect(skip_disk_temp=_skip, skip_temps=not _show_temp)
             _t = time.perf_counter()
             self.render(m)
             _render_dt = time.perf_counter() - _t

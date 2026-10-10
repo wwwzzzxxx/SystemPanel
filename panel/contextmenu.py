@@ -382,6 +382,7 @@ class PanelMenu:
                 pass
             win.configure(bg="#1e1e1e", bd=1, relief="solid")
             on = ops.autostart_enabled()
+            show_temp = app.temp_enabled()
             btn_kw = dict(bg="#1e1e1e", fg="#e8e8e8",
                           activebackground="#3a3a3a", activeforeground="#ffffff",
                           relief="flat", bd=0, anchor="w", padx=12, pady=6,
@@ -389,6 +390,9 @@ class PanelMenu:
             b1 = tk.Button(win, text=f"{'☑' if on else '☐'} 开机启动", width=14, **btn_kw,
                            command=lambda: (app.toggle_autostart(), self._dismiss()))
             b1.pack(fill="x")
+            bt = tk.Button(win, text=f"{'☑' if show_temp else '☐'} 显示温度", width=14, **btn_kw,
+                           command=lambda: (app.toggle_temp(), self._dismiss()))
+            bt.pack(fill="x")
             b2 = tk.Button(win, text="退出", width=14, **btn_kw,
                            command=app.quit_panel)
             b2.pack(fill="x")

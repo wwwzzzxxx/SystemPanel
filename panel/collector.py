@@ -804,12 +804,15 @@ def match_disk_name(label: str, hw_name: str) -> bool:
     return len(common) >= 2
 
 
-def collect(skip_disk_temp: bool = False) -> Metrics:
+def collect(skip_disk_temp: bool = False, skip_temps: bool = False) -> Metrics:
     """采集一轮指标。
 
     skip_disk_temp=True（面板不可见时由调用方传入）：跳过所有
     Storage hw.Update()（同步 SMART passthrough，会顶系统一下），
     CPU 仍走 MSR 直读（微秒级，不中断），硬盘温度沿用缓存不刷新。
+
+    skip_temps=True（右键菜单关掉温度显示时由调用方传入）：一个温度都不读
+    （NVML / MSR / LHM / WMI 全跳过），温度字段留 None，界面不显示 °C。
     """
     global _cpu_temp_source
     _ensure_imports()
@@ -840,7 +843,8 @@ def collect(skip_disk_temp: bool = False) -> Metrics:
             h = _pynvml.nvmlDeviceGetHandleByIndex(0)
             util = _pynvml.nvmlDeviceGetUtilizationRates(h)
             m.gpu_load = float(util.gpu)
-            m.gpu_temp = float(_pynvml.nvmlDeviceGetTemperature(h, _pynvml.NVML_TEMPERATURE_GPU))
+            if not skip_temps:
+                m.gpu_temp = float(_pynvml.nvmlDeviceGetTemperature(h, _pynvml.NVML_TEMPERATURE_GPU))
             mem = _pynvml.nvmlDeviceGetMemoryInfo(h)
             m.vram_total_mb = mem.total / 1024**2
             m.vram_used_mb = mem.used / 1024**2
@@ -924,8 +928,9 @@ def collect(skip_disk_temp: bool = False) -> Metrics:
         # 温度（仅非休眠且管理员才读）。
         # 面板不可见时跳过 Storage.Update()：任何 SMART 查询都要过 storport
         # 等盘中断返回，游戏中表现为一次系统级抖动；CPU 走 MSR 不受影响。
+        # skip_temps（用户关掉温度显示）时连 MSR/WMI 都不走，字段留 None。
         temp_map: dict[str, float] = {}
-        if m.is_admin and not skip_disk_temp:
+        if m.is_admin and not skip_disk_temp and not skip_temps:
             _t_lhm = time.perf_counter()
             raw_temps = _get_lhm_temps_if_admin(sleeping_map, idle_hdd_pds)
             _last_timing["lhm"] = time.perf_counter() - _t_lhm
@@ -947,7 +952,7 @@ def collect(skip_disk_temp: bool = False) -> Metrics:
             for k, v in raw_temps.items():
                 if k.startswith("disk:"):
                     temp_map[k] = v
-        elif m.is_admin and skip_disk_temp:
+        elif m.is_admin and skip_disk_temp and not skip_temps:
             # 不可见：CPU 仍走 MSR 直读（微秒级，不碰 IO 栈），盘温沿用空
             # （用户看不到，下一轮可见时自动刷新；不进 LHM，不碰盘）。
             _last_timing["lhm"] = 0.0
@@ -1019,7 +1024,10 @@ def collect(skip_disk_temp: bool = False) -> Metrics:
     global _collect_count
     _collect_count += 1
     if _collect_count % 20 == 1:
-        print(f"[temp] cpu={m.cpu_temp} src={_cpu_temp_source} admin={m.is_admin}")
+        if skip_temps:
+            print("[temp] off (右键菜单关闭了温度显示，一个温度都不读)")
+        else:
+            print(f"[temp] cpu={m.cpu_temp} src={_cpu_temp_source} admin={m.is_admin}")
     return m
 
 
