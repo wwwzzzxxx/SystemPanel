@@ -38,13 +38,47 @@ _clsbuf = ctypes.create_unicode_buffer(256)
 
 # 游戏白名单：这些进程在跑时一律不问盘（与面板是否可见无关）。
 # 扩展时往里加小写 exe 名即可，如 "dota2.exe"。
-_GAME_PROCESSES = frozenset({"cs2.exe"})
+_GAME_PROCESSES = frozenset({"cs2.exe", "minecraft.windows.exe"})
+
+# Minecraft Java 版没有自己的 exe——启动器（PCL2/官方/HMCL…）起的是一个
+# java/javaw 进程，只匹配 exe 名会误伤所有 Java 程序，只能看命令行特征。
+# 下面任一标记命中即判定为 MC 客户端（标记均来自真实启动命令行，大小写不敏感）：
+#   --gameDir                    vanilla 启动协议参数，官方/PCL/HMCL/MultiMC 都会传
+#   -Dminecraft.launcher.brand=  官方与主流第三方启动器都会打的系统属性
+#   MojangTricksIntelDriversForPerformance  Mojang 那个著名 heapdump 参数，各家启动器都带着
+#   主类名                       原版 / Fabric / Quilt / Forge 的入口类
+# 反向验证：本机 MC 服务端（java -jar fabric-server-launch.jar）以上标记一个都没有，
+# 不会被误判；读不到命令行（进程正在退出/权限不足）时不当成 MC，保持 fail-open。
+_JAVA_PROCESSES = frozenset({"java.exe", "javaw.exe"})
+_MC_CMDLINE_MARKERS = (
+    "--gameDir",
+    "-Dminecraft.launcher.brand=",
+    "MojangTricksIntelDriversForPerformance",
+    "net.minecraft.client.main.Main",
+    "net.fabricmc.loader.impl.launch.knot.KnotClient",  # Fabric 新版
+    "net.fabricmc.loader.launch.knot.KnotClient",  # Fabric 旧版（<=1.14）
+    "org.quiltmc.loader.impl.launch.knot.KnotClient",  # Quilt
+    "cpw.mods.modlauncher.Launcher",  # Forge
+)
+_MC_LABEL = "minecraft(java)"
+
+
+def _is_minecraft_java(proc) -> bool:
+    """按命令行特征判断一个 java/javaw 进程是不是 MC 客户端。"""
+    try:
+        cmd = proc.cmdline()
+    except Exception:
+        return False
+    if not cmd:
+        return False
+    joined = " ".join(cmd).lower()
+    return any(m.lower() in joined for m in _MC_CMDLINE_MARKERS)
 
 
 def game_blocking_temp() -> str | None:
     """白名单游戏在跑就返回其进程名，否则返回 None。
 
-    只扫进程名，不读 IO，不碰盘，每 3s 一轮开销可忽略。
+    只扫进程名/命令行，不读 IO，不碰盘，每 3s 一轮开销可忽略。
     psutil 缺失/枚举失败时返回 None（fail-open，保持旧行为）。
     """
     try:
@@ -59,6 +93,8 @@ def game_blocking_temp() -> str | None:
                 continue
             if name in _GAME_PROCESSES:
                 return name
+            if name in _JAVA_PROCESSES and _is_minecraft_java(p):
+                return _MC_LABEL
     except Exception:
         return None
     return None
