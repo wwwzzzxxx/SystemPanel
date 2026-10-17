@@ -5,6 +5,13 @@
 工作线程等到事件后经 event_generate（Tk 官方跨线程通道）通知主循环。
 钩子回调里不做任何 Python 堆 / Tcl / 打印操作（曾因此 fastfail 崩溃 3 次）。
 
+钩子必须装在自己的专用线程上（`_pump`），不能装在 Tk 主线程：低级钩子的回调
+有线程亲和性，系统把它派发到“安装钩子的那条线程”，并要求它尽快返回，否则
+整个桌面的鼠标事件都会排队等待（LowLevelHooksTimeout 默认 300ms，超时还会把
+钩子静默摘掉）。而主线程每 15s 要花 100~300ms 读硬盘温度（LHM SMART / WMI），
+那期间钩子回调发不出去——用户看到的就是“每次温度刷新鼠标卡一下”。
+`_pump` 线程只跑消息循环，永不执行采集/渲染，回调本身仍是微秒级。
+
 - 右键按下在面板内 -> 按下和随后松开都吞掉（桌面菜单是在松开时弹的），弹我们的菜单
 - 菜单开着时，落在菜单矩形外的任何按下 -> 关菜单（不吞，放行；焦点不可靠，只能靠钩子）
 - 其他情况 -> 原样放行，桌面行为零影响
@@ -31,6 +38,9 @@ WM_LBUTTONDOWN = 0x0201
 WM_RBUTTONDOWN = 0x0204
 WM_MBUTTONDOWN = 0x0207
 WM_RBUTTONUP = 0x0205
+WM_QUIT = 0x0012
+WM_USER = 0x0400
+PM_NOREMOVE = 0x0000
 GWL_EXSTYLE = -20
 INFINITE = 0xFFFFFFFF
 _MENU_EVENT = "<<PanelMenuClick>>"
@@ -85,6 +95,19 @@ def _declare():
                                            ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD, wintypes.DWORD]
         user32.SetWinEventHook.restype = wintypes.HANDLE
         user32.UnhookWinEvent.argtypes = [wintypes.HANDLE]
+        # 钩子线程的消息循环（钩子回调只在这条线程上派发，必须自己泵消息）
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, ctypes.c_uint, ctypes.c_uint]
+        user32.GetMessageW.restype = ctypes.c_int
+        user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                        ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
+        user32.PeekMessageW.restype = wintypes.BOOL
+        user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.restype = ctypes.c_ssize_t
+        user32.PostThreadMessageW.argtypes = [wintypes.DWORD, ctypes.c_uint, ctypes.c_ssize_t, ctypes.c_ssize_t]
+        user32.PostThreadMessageW.restype = wintypes.BOOL
+        kernel32.GetCurrentThreadId.argtypes = []
+        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
     except Exception:
         pass
 
@@ -114,18 +137,52 @@ class PanelMenu:
         self._stop = threading.Event()
         self._thread = None
         self._bound = False
+        # 专用钩子线程（低级钩子回调只在安装它的线程上派发，见模块 docstring）
+        self._pump_thread = None
+        self._pump_tid = 0
+        self._pump_ready = threading.Event()
 
     # ---------- 安装 / 卸载 ----------
     def install(self) -> bool:
         try:
+            self._evt = kernel32.CreateEventW(None, False, False, None)
+            if not self._evt:
+                return False
+            # 主循环上下文（Tk 线程）：钩子线程只读这些原生槽位，不碰 Tcl
+            self._refresh_rect()
+            if not self._bound:
+                try:
+                    self.app.root.bind(_MENU_EVENT, self._on_menu_event)
+                    self._bound = True
+                except Exception:
+                    pass
+            self._stop.clear()
+            self._pump_ready.clear()
+            self._pump_thread = threading.Thread(
+                target=self._pump, name="panel-hook-pump", daemon=True)
+            self._pump_thread.start()
+            # 等钩子装好：装失败/线程起不来都返回 False，调用方降级为只走 Tk 右键
+            if not self._pump_ready.wait(timeout=5.0) or not self._hook:
+                self.uninstall()
+                return False
+            self._thread = threading.Thread(target=self._waiter, daemon=True)
+            self._thread.start()
+            return True
+        except Exception:
+            return False
+
+    def _pump(self) -> None:
+        """钩子线程：装 WH_MOUSE_LL + 只泵消息，永不执行采集/渲染等慢活。
+
+        低级钩子不注入进程，但回调有线程亲和性：系统把它派发到安装钩子的线程，
+        该线程必须正在泵消息且立刻返回，否则整个桌面的鼠标事件都被拖住。主线程
+        每 15s 会卡 100~300ms 读硬盘温度，所以钩子绝不能装在主线程上。
+        """
+        try:
             # 低级钩子(WH_MOUSE_LL)不注入进程，hMod 必须为 NULL（传 exe 句柄会失败）
             self._hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self._proc, None, 0)
             if not self._hook:
-                return False
-            self._evt = kernel32.CreateEventW(None, False, False, None)
-            if not self._evt:
-                self.uninstall()
-                return False
+                return
             # 前台窗口变化（Alt+Tab 等无鼠标事件的切换）也要关菜单，
             # 否则菜单会以置顶态飘在别的窗口上。SKIPOWNPROCESS 跳过自己人。
             try:
@@ -135,25 +192,31 @@ class PanelMenu:
                     WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
             except Exception:
                 self._whook = None
-            self._refresh_rect()
-            if not self._bound:
-                try:
-                    self.app.root.bind(_MENU_EVENT, self._on_menu_event)
-                    self._bound = True
-                except Exception:
-                    pass
-            self._stop.clear()
-            self._thread = threading.Thread(target=self._waiter, daemon=True)
-            self._thread.start()
-            return True
-        except Exception:
-            return False
+            try:
+                self._pump_tid = int(kernel32.GetCurrentThreadId())
+            except Exception:
+                self._pump_tid = 0
+            # 先强制建出消息队列，否则卸载时的 PostThreadMessage 会丢
+            try:
+                _pm = wintypes.MSG()
+                user32.PeekMessageW(ctypes.byref(_pm), None, WM_USER, WM_USER, PM_NOREMOVE)
+            except Exception:
+                pass
+            self._pump_ready.set()
+            msg = wintypes.MSG()
+            while not self._stop.is_set():
+                if user32.GetMessageW(ctypes.byref(msg), None, 0, 0) in (0, -1):
+                    break  # WM_QUIT / 出错
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception as e:
+            print(f"[menu] 钩子线程异常: {e}", file=sys.stderr)
+        finally:
+            self._pump_ready.set()  # 起不来时别让 install 白等 5s
+            self._unhook()
 
-    def uninstall(self) -> None:
-        try:
-            self._dismiss()
-        except Exception:
-            pass
+    def _unhook(self) -> None:
+        """摘钩子（幂等）。低级钩子由安装线程卸最干净，主线程兜底也能摘掉。"""
         try:
             if self._hook:
                 user32.UnhookWindowsHookEx(self._hook)
@@ -168,8 +231,29 @@ class PanelMenu:
             pass
         finally:
             self._whook = None
+
+    def uninstall(self) -> None:
         try:
-            self._stop.set()
+            self._dismiss()
+        except Exception:
+            pass
+        self._stop.set()
+        # 让钩子线程的消息循环退出（它会在 finally 里自己卸钩）
+        try:
+            if self._pump_tid:
+                user32.PostThreadMessageW(self._pump_tid, WM_QUIT, 0, 0)
+        except Exception:
+            pass
+        try:
+            if self._pump_thread and self._pump_thread.is_alive():
+                self._pump_thread.join(timeout=2)
+        except Exception:
+            pass
+        finally:
+            self._pump_thread = None
+            self._pump_tid = 0
+        self._unhook()  # 兜底：线程没起来/超时没卸掉时这里再摘一次
+        try:
             if self._evt:
                 kernel32.SetEvent(self._evt)  # 唤醒 _waiter 让它退出
             if self._thread and self._thread.is_alive():

@@ -185,6 +185,7 @@ A: 任务管理器 → 结束 `pythonw.exe`；彻底停用再运行 `uninstall.b
 | pywin32 | 壁纸层嵌入、PDH、计划任务 | PSF |
 | pythonnet | 加载 LibreHardwareMonitor 的 .NET 程序集 | MIT |
 | PySide6-Essentials | 仅旧版 Qt 代码路径使用，已非默认 | LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only |
+| [OpenSSL](https://www.openssl.org/) 3.x | 面板本身不发起 TLS 连接；是 Python 标准库 `ssl` 的底层实现，PyInstaller 打包时随依赖自动收集（`libcrypto-3-x64.dll` / `libssl-3-x64.dll`） | Apache-2.0 |
 
 **关于 MPL-2.0 的合规说明**：LibreHardwareMonitor 是 MPL-2.0 覆盖的第三方代码，本仓库**源码不分发**它的二进制文件，请按"快速开始"第 2 步自行下载。Release 附带的单文件 exe 内部打包了该 DLL，属于 MPL-2.0 允许的可执行形式分发，但分发时须满足 MPL-2.0 §3.2 的义务，因此在此明确声明：
 
